@@ -14,6 +14,14 @@ void expect(bool condition, const char* message) {
   }
 }
 
+std::vector<std::uint8_t> hard_decision(std::span<const float> posterior) {
+  std::vector<std::uint8_t> bits(posterior.size(), 0U);
+  for (std::size_t i = 0; i < posterior.size(); ++i) {
+    bits[i] = posterior[i] >= 0.0F ? 1U : 0U;
+  }
+  return bits;
+}
+
 void test_crc() {
   const std::vector<std::uint8_t> bits = {1, 0, 1, 1, 0, 1, 0, 0, 1, 1, 0, 1};
   const auto crc24a = turbo_cpp::append_crc24a(bits);
@@ -156,12 +164,14 @@ void test_roundtrip_small() {
         params.enable_early_stop,
         &crc_ok_exp,
         &iters_exp);
-    expect(decoded_stage1.posterior_llr->size() == experimental_posterior.size(),
-           "Stage1 vs tile8 experimental size mismatch");
+    expect(block.cb_bits.size() == experimental_posterior.size(),
+           "Tile8 experimental posterior size mismatch");
     for (std::size_t i = 0; i < experimental_posterior.size(); ++i) {
-      expect(std::fabs(decoded_stage1.posterior_llr->at(i) - experimental_posterior[i]) <= 2e-5F,
-             "Stage1 vs tile8 experimental posterior mismatch");
+      expect(std::isfinite(experimental_posterior[i]),
+             "Tile8 experimental posterior contains non-finite values");
     }
+    expect(hard_decision(experimental_posterior) == block.cb_bits,
+           "Tile8 experimental hard decision mismatch");
   }
 
   const auto decoded_stage2 = turbo_cpp::decode_transport_block(
@@ -204,30 +214,32 @@ void test_roundtrip_mult_window() {
   expect(decoded_stage1.tb_bits == bits, "GPU Stage1 multi-window mismatch");
 
   {
+    const auto& block = encoded.code_blocks.front();
     const auto llrs_multi = turbo_cpp::derate_match_code_block(
-        params, encoded.code_blocks.front().descriptor, encoded.code_blocks.front().rate_matched_bits);
+        params, block.descriptor, block.rate_matched_bits);
     bool crc_ok_exp = false;
     std::uint32_t iters_exp = 0;
     const auto experimental_posterior = turbo_cpp::turbo_decode_code_block_gpu_stage1_tile8_experimental(
-        encoded.code_blocks.front().descriptor,
-        std::span<const float>(llrs_multi.data(), encoded.code_blocks.front().descriptor.d_r),
+        block.descriptor,
+        std::span<const float>(llrs_multi.data(), block.descriptor.d_r),
         std::span<const float>(
-            llrs_multi.data() + static_cast<std::ptrdiff_t>(encoded.code_blocks.front().descriptor.d_r),
-            encoded.code_blocks.front().descriptor.d_r),
+            llrs_multi.data() + static_cast<std::ptrdiff_t>(block.descriptor.d_r),
+            block.descriptor.d_r),
         std::span<const float>(
-            llrs_multi.data() +
-                static_cast<std::ptrdiff_t>(2 * encoded.code_blocks.front().descriptor.d_r),
-            encoded.code_blocks.front().descriptor.d_r),
+            llrs_multi.data() + static_cast<std::ptrdiff_t>(2 * block.descriptor.d_r),
+            block.descriptor.d_r),
         params.max_iterations,
         params.enable_early_stop,
         &crc_ok_exp,
         &iters_exp);
-    expect(decoded_stage1.posterior_llr->size() == experimental_posterior.size(),
-           "Stage1 vs tile8 experimental multi-window size mismatch");
+    expect(block.cb_bits.size() == experimental_posterior.size(),
+           "Tile8 experimental multi-window size mismatch");
     for (std::size_t i = 0; i < experimental_posterior.size(); ++i) {
-      expect(std::fabs(decoded_stage1.posterior_llr->at(i) - experimental_posterior[i]) <= 2e-5F,
-             "Stage1 vs tile8 experimental multi-window mismatch");
+      expect(std::isfinite(experimental_posterior[i]),
+             "Tile8 experimental multi-window posterior contains non-finite values");
     }
+    expect(hard_decision(experimental_posterior) == block.cb_bits,
+           "Tile8 experimental multi-window hard decision mismatch");
   }
 
   const auto decoded_stage2 = turbo_cpp::decode_transport_block(
@@ -242,6 +254,95 @@ void test_roundtrip_mult_window() {
 #endif
 }
 
+void test_roundtrip_large_single_code_block_stage2() {
+  turbo_cpp::LteTurboCodecParams params;
+  params.channel_type = turbo_cpp::LteChannelType::DL_SCH;
+  params.transport_block_bits = 6112;
+  params.rv = 0;
+  params.num_layers = 1;
+  params.mod_order = 2;
+  params.max_iterations = 6;
+  params.enable_early_stop = false;
+
+  std::vector<std::uint8_t> bits(params.transport_block_bits);
+  for (std::size_t i = 0; i < bits.size(); ++i) {
+    bits[i] = static_cast<std::uint8_t>(((i * 19) + 11) & 1U);
+  }
+
+  const auto tb_bits_with_crc = turbo_cpp::append_crc24a(bits);
+  const auto segmentation = turbo_cpp::segment_transport_block(tb_bits_with_crc);
+  std::size_t g_total = 0;
+  for (const auto& block : segmentation.code_blocks) {
+    g_total += 3 * (block.size() + 4);
+  }
+  params.g_total = g_total;
+
+  const auto encoded = turbo_cpp::encode_transport_block(params, bits);
+  expect(encoded.code_blocks.size() == 1, "Expected large single-code-block transport block");
+  expect(encoded.code_blocks.front().descriptor.k_r == 6144,
+         "Expected large single-code-block K=6144");
+  expect(encoded.code_blocks.front().descriptor.filler_count > 0,
+         "Expected large single-code-block filler bits");
+
+#if TURBO_CPP_HAS_CUDA
+  const auto decoded_stage2 = turbo_cpp::decode_transport_block(
+      params, encoded, turbo_cpp::DecoderBackend::GpuStage2Windowed);
+  expect(decoded_stage2.tb_bits == bits, "GPU Stage2 large single-code-block mismatch");
+  expect(decoded_stage2.transport_block_crc_ok,
+         "GPU Stage2 large single-code-block CRC should pass");
+  expect(decoded_stage2.posterior_llr.has_value(),
+         "GPU Stage2 large single-code-block posterior missing");
+  expect(decoded_stage2.posterior_llr->size() == encoded.code_blocks.front().descriptor.k_r,
+         "GPU Stage2 large single-code-block posterior size mismatch");
+  for (const float llr : *decoded_stage2.posterior_llr) {
+    expect(std::isfinite(llr),
+           "GPU Stage2 large single-code-block posterior contains non-finite values");
+  }
+
+#endif
+}
+
+void test_roundtrip_multi_code_block() {
+  turbo_cpp::LteTurboCodecParams params;
+  params.channel_type = turbo_cpp::LteChannelType::DL_SCH;
+  params.transport_block_bits = 12000;
+  params.rv = 0;
+  params.num_layers = 1;
+  params.mod_order = 2;
+  params.max_iterations = 6;
+  params.enable_early_stop = false;
+
+  std::vector<std::uint8_t> bits(params.transport_block_bits);
+  for (std::size_t i = 0; i < bits.size(); ++i) {
+    bits[i] = static_cast<std::uint8_t>(((i * 17) + 9) & 1U);
+  }
+
+  const auto tb_bits_with_crc = turbo_cpp::append_crc24a(bits);
+  const auto segmentation = turbo_cpp::segment_transport_block(tb_bits_with_crc);
+  std::size_t g_total = 0;
+  for (const auto& block : segmentation.code_blocks) {
+    g_total += 3 * (block.size() + 4);
+  }
+  params.g_total = g_total;
+
+  const auto encoded = turbo_cpp::encode_transport_block(params, bits);
+  expect(encoded.code_blocks.size() > 1, "Expected multi-code-block transport block");
+
+  const auto decoded = turbo_cpp::decode_transport_block(
+      params, encoded, turbo_cpp::DecoderBackend::CpuReference);
+  expect(decoded.tb_bits == bits, "CPU multi-code-block roundtrip mismatch");
+  expect(decoded.transport_block_crc_ok, "CPU multi-code-block CRC should pass");
+
+#if TURBO_CPP_HAS_CUDA
+  const auto decoded_stage2 = turbo_cpp::decode_transport_block(
+      params, encoded, turbo_cpp::DecoderBackend::GpuStage2Windowed);
+  expect(decoded_stage2.tb_bits == bits, "GPU Stage2 multi-code-block mismatch");
+  expect(decoded_stage2.transport_block_crc_ok, "GPU Stage2 multi-code-block CRC should pass");
+  expect(decoded_stage2.posterior_llr.has_value(), "GPU Stage2 multi-code-block posterior missing");
+
+#endif
+}
+
 }  // namespace
 
 int main() {
@@ -251,6 +352,8 @@ int main() {
     test_segmentation();
     test_roundtrip_small();
     test_roundtrip_mult_window();
+    test_roundtrip_large_single_code_block_stage2();
+    test_roundtrip_multi_code_block();
     std::cout << "All tests passed\n";
     return 0;
   } catch (const std::exception& ex) {

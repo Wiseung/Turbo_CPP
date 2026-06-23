@@ -66,6 +66,8 @@ struct EncodedTransportBlock {
 
 struct DecodedTransportBlock {
   std::vector<std::uint8_t> tb_bits;
+  // Per-code-block CRC is reported for segmented transport blocks. For single-code-block
+  // transport blocks, transport_block_crc_ok remains the primary correctness signal.
   std::vector<bool> code_block_crc_ok;
   bool transport_block_crc_ok = false;
   std::uint32_t iterations_used = 0;
