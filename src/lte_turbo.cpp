@@ -4,6 +4,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <future>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
@@ -37,6 +38,7 @@ std::vector<float> turbo_decode_code_block_gpu_stage1_tile8_experimental_cuda_im
     bool enable_early_stop,
     bool* crc_ok,
     std::uint32_t* iterations_used);
+
 #endif
 
 namespace {
@@ -398,6 +400,12 @@ void normalize_state_metrics(std::array<float, 8>& metrics) {
     }
   }
 }
+
+struct CodeBlockDecodeResult {
+  std::vector<float> posterior;
+  bool cb_crc_ok = false;
+  std::uint32_t iterations = 0;
+};
 
 std::vector<float> decode_siso_log_map(std::span<const float> sys_llr,
                                        std::span<const float> parity_llr,
@@ -813,7 +821,7 @@ std::vector<float> turbo_decode_code_block_gpu_stage1(const CodeBlockDescriptor&
                                                       bool* crc_ok,
                                                       std::uint32_t* iterations_used) {
 #if TURBO_CPP_HAS_CUDA
-  return turbo_decode_code_block_gpu_stage1_tile8_experimental_cuda_impl(
+  return turbo_decode_code_block_gpu_stage1_cuda_impl(
       descriptor, d0_llr, d1_llr, d2_llr, max_iterations, enable_early_stop, crc_ok,
       iterations_used);
 #else
@@ -887,58 +895,83 @@ DecodedTransportBlock decode_transport_block(const LteTurboCodecParams& params,
   out.code_block_crc_ok.reserve(encoded.code_blocks.size());
   out.posterior_llr = std::vector<float>{};
 
-  std::vector<std::uint8_t> tb_bits_with_crc;
-  for (const auto& block : encoded.code_blocks) {
+  auto decode_block = [&](const EncodedCodeBlock& block) -> CodeBlockDecodeResult {
     const auto llrs = derate_match_code_block(params, block.descriptor, block.rate_matched_bits);
     const auto d = block.descriptor.d_r;
-    bool cb_crc_ok = false;
-    std::uint32_t iterations = 0;
-    std::vector<float> posterior;
+    CodeBlockDecodeResult result;
     switch (backend) {
       case DecoderBackend::CpuReference:
-        posterior = turbo_decode_code_block_cpu(
+        result.posterior = turbo_decode_code_block_cpu(
             block.descriptor,
             std::span<const float>(llrs.data(), d),
             std::span<const float>(llrs.data() + static_cast<std::ptrdiff_t>(d), d),
             std::span<const float>(llrs.data() + static_cast<std::ptrdiff_t>(2 * d), d),
             params.max_iterations,
             params.enable_early_stop,
-            &cb_crc_ok,
-            &iterations);
+            &result.cb_crc_ok,
+            &result.iterations);
         break;
       case DecoderBackend::GpuStage1Exact:
-        posterior = turbo_decode_code_block_gpu_stage1(
+        result.posterior = turbo_decode_code_block_gpu_stage1(
             block.descriptor,
             std::span<const float>(llrs.data(), d),
             std::span<const float>(llrs.data() + static_cast<std::ptrdiff_t>(d), d),
             std::span<const float>(llrs.data() + static_cast<std::ptrdiff_t>(2 * d), d),
             params.max_iterations,
             params.enable_early_stop,
-            &cb_crc_ok,
-            &iterations);
+            &result.cb_crc_ok,
+            &result.iterations);
         break;
       case DecoderBackend::GpuStage2Windowed:
-        posterior = turbo_decode_code_block_gpu_stage2(
+        result.posterior = turbo_decode_code_block_gpu_stage2(
             block.descriptor,
             std::span<const float>(llrs.data(), d),
             std::span<const float>(llrs.data() + static_cast<std::ptrdiff_t>(d), d),
             std::span<const float>(llrs.data() + static_cast<std::ptrdiff_t>(2 * d), d),
             params.max_iterations,
             params.enable_early_stop,
-            &cb_crc_ok,
-            &iterations);
+            &result.cb_crc_ok,
+            &result.iterations);
         break;
     }
-    out.iterations_used = std::max(out.iterations_used, iterations);
-    auto decoded = hard_decision(posterior);
+    return result;
+  };
+
+  std::vector<CodeBlockDecodeResult> block_results(encoded.code_blocks.size());
+  if (backend == DecoderBackend::GpuStage2Windowed && encoded.code_blocks.size() > 1) {
+    std::vector<std::future<CodeBlockDecodeResult>> futures;
+    futures.reserve(encoded.code_blocks.size());
+    for (std::size_t i = 0; i < encoded.code_blocks.size(); ++i) {
+      futures.push_back(std::async(std::launch::async, [&decode_block, &encoded, i] {
+        return decode_block(encoded.code_blocks[i]);
+      }));
+    }
+    for (std::size_t i = 0; i < futures.size(); ++i) {
+      block_results[i] = futures[i].get();
+    }
+  } else {
+    for (std::size_t i = 0; i < encoded.code_blocks.size(); ++i) {
+      block_results[i] = decode_block(encoded.code_blocks[i]);
+    }
+  }
+
+  std::vector<std::uint8_t> tb_bits_with_crc;
+  for (std::size_t i = 0; i < encoded.code_blocks.size(); ++i) {
+    const auto& block = encoded.code_blocks[i];
+    auto& result = block_results[i];
+    out.iterations_used = std::max(out.iterations_used, result.iterations);
+    auto decoded = hard_decision(result.posterior);
     decoded.erase(decoded.begin(),
                   decoded.begin() + static_cast<std::ptrdiff_t>(block.descriptor.filler_count));
+    bool block_crc_ok = true;
     if (encoded.code_blocks.size() > 1) {
+      block_crc_ok = check_crc24b(decoded);
       decoded.resize(decoded.size() - 24);
     }
     tb_bits_with_crc.insert(tb_bits_with_crc.end(), decoded.begin(), decoded.end());
-    out.code_block_crc_ok.push_back(cb_crc_ok || encoded.code_blocks.size() == 1);
-    out.posterior_llr->insert(out.posterior_llr->end(), posterior.begin(), posterior.end());
+    out.code_block_crc_ok.push_back(block_crc_ok);
+    out.posterior_llr->insert(out.posterior_llr->end(),
+                              result.posterior.begin(), result.posterior.end());
   }
   out.transport_block_crc_ok = check_crc24a(tb_bits_with_crc);
   out.tb_bits.assign(tb_bits_with_crc.begin(),
